@@ -41,3 +41,7 @@ class PanelError(AssemblerError):
 
 class AnswerTransferError(AssemblerError):
     """回答转移表绑定、修订录入或汇总维护失败（坏输入/冲突/端点不符）。"""
+
+
+class DeliveryError(AssemblerError):
+    """研究交付包无法生成或领取（规格非法/未授权/已停领/不存在）。"""

@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from . import eligibility as elig
 from . import panel as _panel
 from . import answers as _answers
+from . import delivery as _delivery
 from .errors import (
     AssembleError,
     EventRejectedError,
@@ -1136,6 +1137,40 @@ class SampleAssembler:
     def list_answer_batches(self):
         """查看每批录入的审计行（受影响成员/区段/配对数量）。"""
         return _answers.list_batches(self.conn)
+
+    # ================================================================ 研究交付包
+    # 只读既有 panel 计划/回答转移表；不改变调查表、轮换规则与回答转移表行为。
+    def grant_delivery_authorization(self, plan_id, panel_member_id):
+        """管理员登记 (plan_id, panel_member_id) 的交付授权（持久）。"""
+        return _delivery.grant_authorization(
+            self.conn, plan_id, panel_member_id)
+
+    def revoke_delivery_authorization(self, plan_id, panel_member_id):
+        """撤回授权；已交付成员在选定计划的撤回会使相关包永久停领。"""
+        return _delivery.revoke_authorization(
+            self.conn, plan_id, panel_member_id)
+
+    def list_delivery_authorizations(self, plan_id=None):
+        """管理员核对：当前授权状态。"""
+        return _delivery.list_authorizations(self.conn, plan_id)
+
+    def generate_delivery_package(self, request_key, plan_ids, k, group_tree,
+                                  endpoint_plan_id=None):
+        """生成交付包（生成 + 完整结果 + 可领取状态同一条提交）。
+
+        plan_ids: 绑定链上至少两个不同 plan_id（按链序使用，输入顺序无关）。
+        k: 最小人数 >=2。group_tree: 节点标签唯一的树，叶子显式对应层。
+        """
+        return _delivery.generate_package(
+            self, request_key, plan_ids, k, group_tree, endpoint_plan_id)
+
+    def claim_delivery_package(self, package_id):
+        """课题组领取入口：只按包标识返回答卷；已停领的包一律拒绝。"""
+        return _delivery.claim_package(self.conn, package_id)
+
+    def list_delivery_packages(self):
+        """管理员核对：包清单（规格/成员数/是否停领；无内部成员标识）。"""
+        return _delivery.list_packages(self.conn)
 
 
 class _RetryAssemble(Exception):

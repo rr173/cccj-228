@@ -9,7 +9,7 @@
 - 资格事件以 (frame_id, event_type, event_time, source_seq) 去重，实现幂等。
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_STATEMENTS = [
     """
@@ -419,6 +419,80 @@ SCHEMA_STATEMENTS = [
         revision        INTEGER NOT NULL,
         PRIMARY KEY (batch_id, plan_id, panel_member_id, revision)
     )
+    """,
+    # ---- 研究交付包：管理员登记的交付授权 ------------------------------
+    # 按 (plan_id, panel_member_id) 显式授予/撤回；未授予视为无权。
+    # 只有绑定回答转移链上的在样记录才能登记。authorized=1 才能用于交付；
+    # 撤回只切换状态并留时间戳，不删除授权行（审计 + 撤回后不可恢复的旧包
+    # 失效判定都依赖它）。
+    """
+    CREATE TABLE IF NOT EXISTS delivery_authorization (
+        plan_id         INTEGER NOT NULL,
+        panel_member_id TEXT NOT NULL,
+        authorized      INTEGER NOT NULL DEFAULT 0,
+        granted_at      TEXT,
+        revoked_at      TEXT,
+        updated_at      TEXT NOT NULL,
+        PRIMARY KEY (plan_id, panel_member_id),
+        FOREIGN KEY (plan_id, panel_member_id)
+            REFERENCES answer_transfer_sample(plan_id, panel_member_id)
+    )
+    """,
+    # 一次交付的请求键。规格指纹用于识别“同键改规格”；同键同指纹直接
+    # 返回已有包（含被撤回停领的包），不重算、不改写。
+    """
+    CREATE TABLE IF NOT EXISTS delivery_package (
+        package_id      TEXT PRIMARY KEY,          -- DP_<随机>，可对外公开
+        request_key     TEXT NOT NULL UNIQUE,
+        spec_fingerprint TEXT NOT NULL,
+        endpoint_plan_id INTEGER NOT NULL
+            REFERENCES panel_plan(plan_id),
+        min_members     INTEGER NOT NULL CHECK (min_members >= 2),
+        plan_chain_json TEXT NOT NULL,             -- 选定计划按链顺序
+        group_tree_json TEXT NOT NULL,             -- 收到规格中的分组树
+        created_at      TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS delivery_package_plan (
+        package_id  TEXT NOT NULL REFERENCES delivery_package(package_id),
+        plan_id     INTEGER NOT NULL REFERENCES panel_plan(plan_id),
+        chain_index INTEGER NOT NULL,              -- 选定计划在绑定链上的位置
+        PRIMARY KEY (package_id, plan_id),
+        UNIQUE (package_id, chain_index)
+    )
+    """,
+    # 包内交付成员的答卷：代号 + 公开组名 + 每个选定计划的二值答案。
+    # member_ref 只用于内部撤回比对，领取接口不读取、不返回。
+    """
+    CREATE TABLE IF NOT EXISTS delivery_member (
+        package_id      TEXT NOT NULL
+            REFERENCES delivery_package(package_id),
+        member_ref      TEXT NOT NULL,             -- 内部：panel_member_id
+        code            TEXT NOT NULL,             -- 包内代号（对外）
+        group_name      TEXT NOT NULL,             -- 公开组名（对外）
+        group_depth     INTEGER NOT NULL,          -- 公开组深度（根=0）
+        answers_json    TEXT NOT NULL,             -- 按选定计划顺序的 0/1
+        PRIMARY KEY (package_id, member_ref),
+        UNIQUE (package_id, code)
+    )
+    """,
+    # 某个交付成员在某个选定计划上的授权后来被撤回 -> 整个包永久停领。
+    # 与撤回在同一 BEGIN IMMEDIATE 事务内写入，领取端只看这张表，不存在
+    # “已撤回但仍可领取”的可见中间状态。
+    """
+    CREATE TABLE IF NOT EXISTS delivery_revocation (
+        package_id      TEXT NOT NULL
+            REFERENCES delivery_package(package_id),
+        plan_id         INTEGER NOT NULL,
+        panel_member_id TEXT NOT NULL,
+        revoked_at      TEXT NOT NULL,
+        PRIMARY KEY (package_id, plan_id, panel_member_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_delivery_revocation_package
+        ON delivery_revocation(package_id)
     """,
 ]
 

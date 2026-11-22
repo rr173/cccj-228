@@ -15,6 +15,7 @@ sample_assembler/          装配器实现（无第三方依赖，仅标准库�
   assembler.py             单轮导入/装配/预览/发布/追溯 + panel/回答转移委托
   panel.py                 跨轮次轮换：规则导入/计划生成/预览/发布/追溯
   answers.py               回答转移：端点绑定/修订录入/增量配对/汇总
+  delivery.py              研究交付包：交付授权/分组求解/停领/领取
   errors.py                领域错误
 reference/
   reference_sim.py         单轮装配独立参考模拟程序
@@ -23,9 +24,11 @@ tests/
   fixtures.py              单轮手工场景
   panel_fixtures.py        三轮两层 panel 手工场景
   answer_fixtures.py       回答转移场景（四轮已发布计划链 + 离样回归）
+  delivery_fixtures.py     研究交付包场景（三层四轮 + 跳轮离样 + 兄弟叶）
   test_assembler.py        单轮端到端断言 + 参考核对（65 项）
   test_panel.py            panel 端到端断言 + 逐轮参考核对（81 项）
   test_answer_transfer.py  回答转移表：配对/更正/冲突/重开（70 项）
+  test_delivery.py         研究交付包：授权/分组/停领/幂等/交错
   test_concurrency.py      双进程交错装配测试
   _concurrent_worker.py    并发装配 worker
   _panel_worker.py         并发 panel 计划 worker
@@ -37,6 +40,7 @@ tests/
 python3 -I tests/test_assembler.py      # 65 项单轮功能/证据/参考核对
 python3 -I tests/test_panel.py          # 81 项 panel 轮换/账本/参考核对
 python3 -I tests/test_answer_transfer.py  # 70 项回答转移/增量更正/事务
+python3 -I tests/test_delivery.py       # 95 项研究交付包/授权/分组/停领/交错
 python3 -I tests/test_concurrency.py    # 两个装配进程交错，验证无双重分配
 ```
 
@@ -184,6 +188,15 @@ asm.answer_transfer_binding()              # 当前绑定与已发布计划链
 asm.list_answer_segments(panel_member_id=None)  # 区段与每轮有效答案（核对用）
 asm.list_answer_pairs(panel_member_id=None)     # 内部配对明细（核对用）
 asm.list_answer_batches()                  # 每批录入审计（受影响成员/区段）
+
+# 研究交付包
+asm.grant_delivery_authorization(plan_id, panel_member_id)
+asm.revoke_delivery_authorization(plan_id, panel_member_id)
+asm.list_delivery_authorizations(plan_id=None)      # 管理员核对
+asm.generate_delivery_package(request_key, plan_ids, k, group_tree,
+                              endpoint_plan_id=None)
+asm.claim_delivery_package(package_id)              # 课题组领取
+asm.list_delivery_packages()                        # 管理员核对
 ```
 
 - 只沿端点计划 `base_plan_id` 回溯得到的**已发布计划链（含端点）**工作：
@@ -253,6 +266,72 @@ asm.answer_transfer_summary()
   修订/区段/配对/有效答案表的语句只出现受影响成员；读取汇总不触碰这些表。
   另对无关成员的配对明细与有效答案做逐行快照对照。
 
+## 研究交付包（跨轮次答卷出库）
+
+外部课题组要研究同一批受访者在若干指定轮次的回答，但不能拿到内部调查库。
+管理员选择轮次、登记交付授权，课题组最终领到可跨轮对照的答卷。本能力只读
+既有 panel 计划/账本与回答转移表，**不改变**调查表、轮换规则与回答转移表
+行为。
+
+### 用法
+
+```python
+asm = SampleAssembler("var/survey.db")
+# 1) 管理员按 (plan_id, panel_member_id) 登记授权（持久；未授予视为无权）
+asm.grant_delivery_authorization(plan_id=4, panel_member_id="PM_...")
+asm.revoke_delivery_authorization(plan_id=4, panel_member_id="PM_...")
+
+# 2) 生成交付包：选定绑定链上的若干计划、最小人数 k>=2、唯一标签分组树
+tree = {"label": "G", "children": [
+    {"label": "L1", "stratum": "S1"},
+    {"label": "L2", "stratum": "S2"}]}
+pkg = asm.generate_delivery_package(
+    request_key="STUDY-2026-Q4", plan_ids=[1, 4], k=2, group_tree=tree)
+
+# 3) 课题组领取（只返回包标识、轮次顺序、每个成员一条记录）
+claim = asm.claim_delivery_package(pkg["package_id"])
+# {"package_id": "DP_...", "rounds": [1, 4],
+#  "members": [{"code": "C...", "group": "L1", "answers": [0, 0]}, ...]}
+```
+
+### 语义要点
+
+- **规格**：一次交付指定一个已绑定回答转移表的库、绑定链上**至少两个不同**
+  的已发布 `plan_id`、`k >= 2`、唯一标签分组树（叶子显式对应层，一层一片叶）
+  与请求键。计划按**链序**使用（输入顺序无关）；同轮其他计划不能替代。
+- **候选**：在每个选定计划都有在样记录 + 有效回答 + 交付授权，并沿**同一
+  在样区段**贯穿第一个到最后一个选定计划。中间未选为答卷列的轮次仍**不能
+  离样**，但不要求有答案或授权。以**第一个选定计划**账本记录的层作为分组
+  起点，不随后续改层漂移。
+- **分组**：候选中有未映射的层即拒绝交付。选定节点收下其子树内**全部**
+  合格成员且人数须达 `k`；同包选定节点构成反链（不能同时选节点与后代），
+  不拆成员凑数；可整棵子树不交付。优化：先最大化交付人数，再最大化各成员
+  公开组深度之和（根深度 0）；不输出空组，不用额外表披露更细分组。
+- **停领**：任一已交付成员在某选定计划的授权**后来被撤回**，整个包永久
+  停领（再次授予也不恢复；出库请用新请求键重算）。撤回与停领标记在同一
+  `BEGIN IMMEDIATE` 事务内落库，领取也在同一事务内校验，故无可见中间状态；
+  同键重试不能绕过停领。未交付成员、未选轮次的撤回不使包失效。不追回已
+  下载副本。
+- **幂等/不可变**：同键同规格（轮次乱序、树兄弟顺序不算更改）返回原包标识；
+  同键改规格报错；答案后续修订不改变已生成答卷。生成、完整结果与可领取
+  状态是同一条提交。代号包内稳定唯一、与原成员标识无关且不跨包关联。
+
+### 测试与验证（tests/test_delivery.py，95 项）
+
+- 两兄弟叶各 2 人、`k=2` 时分别按叶交付（组名 L1/L2），逐条核对交付成员
+  与组名、答案按轮次顺序；跳轮选择时首尾在样但中间离样的成员被排除，中间
+  未选轮次无答案/无授权不影响。
+- 未映射层拒绝、同轮备选 draft 不能替代、链上非在样/未知成员不能登记授权、
+  `k<2`、节点标签重复/一层多叶/叶缺 stratum 等规格校验（失败不留半个包）。
+- 分组最优：人数相同取更深节点；`k=3` 时提升到父组；含 1 人子树时按“先
+  最大化人数”归父组、不输出空组；反链与不拆人不重复。
+- 撤回：已交付成员在选定计划撤回使旧包停领（再授予、同键重试均不恢复）；
+  新键把剩余三人归到父组；未交付成员/未选轮次撤回不影响。
+- 请求重试（乱序/兄弟顺序）、同键改规格报错、答案修订不改旧答卷、重开库
+  后授权/停领/幂等持久、撤回再授权循环。
+- 两连接交错（领取×撤回、生成×撤回）：成功结果都对应某个完整且仍可领取
+  的版本，撤回提交后一律拒绝，无半撤回/缺员版本。
+
 ## 接口一览
 
 ```python
@@ -275,6 +354,13 @@ asm.list_frame(version, stratum_code=None,         # keyset 分页（大名单�
                page_size=500, after_frame_id=None)
 asm.trace_unit(identifier)                         # frame_id / BU / sample_id
 asm.list_batches()
+
+# 研究交付包（见上文「研究交付包」章节）
+asm.grant_delivery_authorization(plan_id, panel_member_id)
+asm.revoke_delivery_authorization(plan_id, panel_member_id)
+asm.generate_delivery_package(request_key, plan_ids, k, group_tree)
+asm.claim_delivery_package(package_id)
+asm.list_delivery_packages()
 ```
 
 `trace_unit` 返回单位的名单行、身份映射、全部资格事件（含被拒事件）、
@@ -308,3 +394,21 @@ asm.list_batches()
   备选 draft 不重复占用主计划候选；stale/篡改计划发布被拒绝且上一份
   已发布计划不变；账本跨轮次只增不改；
 - 双进程相同请求键并发：只产生一个计划，候选零重复占用。
+
+### 研究交付包（tests/test_delivery.py，95 项）
+
+- 三层（S1/S2/S3）四轮已发布计划链 + 同轮备选 draft；样本成员含跳轮离样、
+  拒绝离样、冷却后以新名单行回归（同一 panel_member）。
+- 两兄弟叶各 2 人、`k=2` 时分别按叶交付（L1/L2），逐条核对交付成员、组名与
+  答案序列；跳轮选择时首尾在样但中间离样的成员被排除，中间未选轮次无答案/
+  无授权不影响；S3 未映射时拒绝交付。
+- 规格校验（同轮备选不能替代、链上非在样/未知成员不能登记授权、`k<2`、
+  节点标签重复/一层多叶/叶缺 stratum、候选不足）失败均不留半个包。
+- 分组最优：人数相同取更深节点；`k=3` 提升到父组；含 1 人子树时按“先最大
+  化人数”归父组、不输出空组；反链且不拆人。
+- 撤回：选定计划上的已交付成员撤回使旧包永久停领（再授予、同键重试均不恢
+  复），新键把剩余三人归到父组；未交付成员、未选轮次的撤回不影响。
+- 幂等：同键同规格（轮次乱序、树兄弟顺序）返回原包；同键改规格报错；答案
+  修订不改变已生成答卷；重开后授权/停领/幂等持久。
+- 两连接交错（领取×撤回、生成×撤回）：成功结果都对应某完整且仍可领取的
+  版本，撤回提交后一律拒绝，无半撤回/缺员版本。
