@@ -9,7 +9,7 @@
 - 资格事件以 (frame_id, event_type, event_time, source_seq) 去重，实现幂等。
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_STATEMENTS = [
     """
@@ -295,6 +295,129 @@ SCHEMA_STATEMENTS = [
         reason       TEXT,                     -- 不可补齐 / 留存不足说明
         considered_json TEXT NOT NULL DEFAULT '[]',
         UNIQUE (plan_id, stratum_code)
+    )
+    """,
+    # ---- 访谈回答转移：单库单端点绑定（只读既有 panel 数据） ----------
+    # 一个库只维护一份转移汇总；绑定行存在后只能以同一端点重复初始化。
+    """
+    CREATE TABLE IF NOT EXISTS answer_transfer_binding (
+        id               INTEGER PRIMARY KEY CHECK (id = 1),
+        endpoint_plan_id INTEGER NOT NULL REFERENCES panel_plan(plan_id),
+        endpoint_wave    INTEGER NOT NULL,
+        created_at       TEXT NOT NULL
+    )
+    """,
+    # 端点沿 base_plan_id 回溯得到的“已发布计划链”（含端点）。只含链上计划。
+    """
+    CREATE TABLE IF NOT EXISTS answer_transfer_chain (
+        plan_id     INTEGER PRIMARY KEY REFERENCES panel_plan(plan_id),
+        wave        INTEGER NOT NULL,
+        chain_index INTEGER NOT NULL,          -- 0=链上最早一轮
+        base_plan_id INTEGER,
+        UNIQUE (chain_index)
+    )
+    """,
+    # 链上每个在样记录（retained/joined）的层与在样区段；层取自该计划账本。
+    """
+    CREATE TABLE IF NOT EXISTS answer_transfer_sample (
+        plan_id         INTEGER NOT NULL
+            REFERENCES answer_transfer_chain(plan_id),
+        panel_member_id TEXT NOT NULL REFERENCES panel_member(panel_member_id),
+        wave            INTEGER NOT NULL,
+        chain_index     INTEGER NOT NULL,
+        stratum_code    TEXT NOT NULL,
+        segment_no      INTEGER NOT NULL,      -- 同一成员内连续在样区段编号
+        PRIMARY KEY (plan_id, panel_member_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_answer_sample_member_segment
+        ON answer_transfer_sample(panel_member_id, segment_no, chain_index)
+    """,
+    # 访谈修订原始流（只接受链上在样记录的键）：answer=NULL 表示作废。
+    """
+    CREATE TABLE IF NOT EXISTS answer_revision (
+        plan_id         INTEGER NOT NULL,
+        panel_member_id TEXT NOT NULL,
+        revision        INTEGER NOT NULL CHECK (revision > 0),
+        answer          INTEGER CHECK (answer IS NULL OR answer IN (0, 1)),
+        recorded_at     TEXT NOT NULL,
+        PRIMARY KEY (plan_id, panel_member_id, revision),
+        FOREIGN KEY (plan_id, panel_member_id)
+            REFERENCES answer_transfer_sample(plan_id, panel_member_id)
+    )
+    """,
+    # 每个 (计划, 成员) 的最大修订号及其答案（答案可能为 NULL=作废）。
+    """
+    CREATE TABLE IF NOT EXISTS answer_effective (
+        plan_id         INTEGER NOT NULL,
+        panel_member_id TEXT NOT NULL,
+        revision        INTEGER NOT NULL,
+        answer          INTEGER,
+        PRIMARY KEY (plan_id, panel_member_id),
+        FOREIGN KEY (plan_id, panel_member_id)
+            REFERENCES answer_transfer_sample(plan_id, panel_member_id)
+    )
+    """,
+    # 区段内已推导的相邻有效回答配对（内部明细，用于增量更正）。
+    """
+    CREATE TABLE IF NOT EXISTS answer_transfer_pair (
+        pair_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        panel_member_id TEXT NOT NULL,
+        segment_no      INTEGER NOT NULL,
+        from_plan_id    INTEGER NOT NULL,
+        from_wave       INTEGER NOT NULL,
+        to_plan_id      INTEGER NOT NULL,
+        to_wave         INTEGER NOT NULL,
+        stratum_code    TEXT NOT NULL,         -- 起点记录的层
+        from_answer     INTEGER NOT NULL,
+        to_answer       INTEGER NOT NULL,
+        FOREIGN KEY (from_plan_id, panel_member_id)
+            REFERENCES answer_transfer_sample(plan_id, panel_member_id),
+        FOREIGN KEY (to_plan_id, panel_member_id)
+            REFERENCES answer_transfer_sample(plan_id, panel_member_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_answer_pair_member_segment
+        ON answer_transfer_pair(panel_member_id, segment_no)
+    """,
+    # 分析员直接读取的唯一汇总表：起止轮 + 起点层 + 前后答案 -> 配对数。
+    """
+    CREATE TABLE IF NOT EXISTS answer_transfer_summary (
+        start_wave   INTEGER NOT NULL,
+        end_wave     INTEGER NOT NULL,
+        stratum_code TEXT NOT NULL,
+        from_answer  INTEGER NOT NULL,
+        to_answer    INTEGER NOT NULL,
+        pair_count   INTEGER NOT NULL CHECK (pair_count > 0),
+        PRIMARY KEY (start_wave, end_wave, stratum_code, from_answer, to_answer)
+    )
+    """,
+    # 每批录入的审计行（不含配对明细；用于确认只重推了受影响区段）。
+    """
+    CREATE TABLE IF NOT EXISTS answer_revision_batch (
+        batch_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        endpoint_plan_id INTEGER NOT NULL REFERENCES panel_plan(plan_id),
+        received_count   INTEGER NOT NULL,
+        unique_count     INTEGER NOT NULL,
+        stored_count     INTEGER NOT NULL,
+        affected_members INTEGER NOT NULL,
+        affected_segments INTEGER NOT NULL,
+        pair_count       INTEGER NOT NULL,
+        affected_json    TEXT NOT NULL DEFAULT '[]',
+        created_at       TEXT NOT NULL
+    )
+    """,
+    # 本批新落库的修订键（审计 + 测试“只重推受影响区段”的证据）。
+    """
+    CREATE TABLE IF NOT EXISTS answer_revision_batch_item (
+        batch_id        INTEGER NOT NULL
+            REFERENCES answer_revision_batch(batch_id),
+        plan_id         INTEGER NOT NULL,
+        panel_member_id TEXT NOT NULL,
+        revision        INTEGER NOT NULL,
+        PRIMARY KEY (batch_id, plan_id, panel_member_id, revision)
     )
     """,
 ]

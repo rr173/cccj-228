@@ -9,11 +9,12 @@
 
 ```
 sample_assembler/          装配器实现（无第三方依赖，仅标准库）
-  schema.py                SQLite schema 与关键唯一索引（v2：含 panel 表）
+  schema.py                SQLite schema 与关键唯一索引（v3：含回答转移表）
   rules.py                 层规则编译、边界语义、冲突检测
   eligibility.py           资格事件状态机
-  assembler.py             单轮导入/装配/预览/发布/追溯 + panel 接口委托
+  assembler.py             单轮导入/装配/预览/发布/追溯 + panel/回答转移委托
   panel.py                 跨轮次轮换：规则导入/计划生成/预览/发布/追溯
+  answers.py               回答转移：端点绑定/修订录入/增量配对/汇总
   errors.py                领域错误
 reference/
   reference_sim.py         单轮装配独立参考模拟程序
@@ -21,8 +22,10 @@ reference/
 tests/
   fixtures.py              单轮手工场景
   panel_fixtures.py        三轮两层 panel 手工场景
+  answer_fixtures.py       回答转移场景（四轮已发布计划链 + 离样回归）
   test_assembler.py        单轮端到端断言 + 参考核对（65 项）
   test_panel.py            panel 端到端断言 + 逐轮参考核对（81 项）
+  test_answer_transfer.py  回答转移表：配对/更正/冲突/重开（70 项）
   test_concurrency.py      双进程交错装配测试
   _concurrent_worker.py    并发装配 worker
   _panel_worker.py         并发 panel 计划 worker
@@ -33,6 +36,7 @@ tests/
 ```bash
 python3 -I tests/test_assembler.py      # 65 项单轮功能/证据/参考核对
 python3 -I tests/test_panel.py          # 81 项 panel 轮换/账本/参考核对
+python3 -I tests/test_answer_transfer.py  # 70 项回答转移/增量更正/事务
 python3 -I tests/test_concurrency.py    # 两个装配进程交错，验证无双重分配
 ```
 
@@ -163,6 +167,91 @@ asm.publish_plan(plan_id)                       # 发布（失败不影响已发
 asm.trace_panel_member(identifier)              # panel_member / BU / frame 追溯
 asm.list_panel_plans(); asm.current_panel()     # 计划列表 / 当前在样 panel
 ```
+
+## 回答转移表（访谈修订增量维护）
+
+分析员想按调查分层统计“同一人在持续在样期间，某道二值题从哪一轮、哪种答案
+转到哪一轮、哪种答案”。本能力只读既有 panel 计划/账本与调查原始数据，
+**不重新计算样本或轮换计划**。
+
+### 初始绑定与链范围
+
+```python
+asm.init_answer_transfer(plan_id)          # 只接受已发布的端点计划
+asm.submit_answer_revisions(revisions)     # 批量录入/更正访谈修订
+asm.answer_transfer_summary()              # 直接读持久化汇总（不重跑配对）
+asm.answer_transfer_binding()              # 当前绑定与已发布计划链
+asm.list_answer_segments(panel_member_id=None)  # 区段与每轮有效答案（核对用）
+asm.list_answer_pairs(panel_member_id=None)     # 内部配对明细（核对用）
+asm.list_answer_batches()                  # 每批录入审计（受影响成员/区段）
+```
+
+- 只沿端点计划 `base_plan_id` 回溯得到的**已发布计划链（含端点）**工作：
+  不含最初的单轮抽样批次（`base_batch_id` / `published_version`）、不含同轮
+  的其他计划（如备选 draft）、也不含端点之后发布的计划。
+- 一个库只维护一份转移表：同一端点重复初始化幂等、不清空已有修订/配对/汇总；
+  已绑定其他端点时拒绝换绑。
+
+### 在样区段与层
+
+- 成员身份取既有 `panel_member_id`；在样记录取账本 `decision` 为 `retained`
+  或 `joined` 的轮次。沿链**连续出现**构成一个在样区段；缺席（该计划账本无该
+  成员）或 `exited` 都切断区段，之后重新加入另起区段，**不跨区段配对**。
+- 每次在样记录的层取**该计划账本行**的 `stratum_code`，不读成员当前层或锚定
+  名单行。回归成员换层时按其新计划账本的层统计。
+
+### 修订语义
+
+`revision` 包含 `{plan_id, panel_member_id, revision, answer}`，`answer` 为
+`0` / `1` / `None`（作废）。
+
+- 只接受绑定链上的在样记录；其他计划、缺席/已退出轮次、端点后发布的计划均拒绝。
+- 同一 (计划, 成员) 以**最大修订号**为准；没有答案或最新修订作废都不是有效
+  端点，但**不切断在样区段**（配对可跨过它们接上）。
+- 相同键同号同答案可重送（`duplicate`，不重复落库、不重推）；同号不同答案
+  使**整批无效**，即使该修订已不是最新；批内顺序无关，晚到的旧修订只入库、
+  不改变有效答案与配对。
+- 坏输入、冲突、非链上键一律整批回滚：修订、有效答案、配对明细、汇总与审计
+  行在同一 `BEGIN IMMEDIATE` 事务内提交，重开数据库看到完整已提交结果。
+
+### 配对与汇总
+
+转移汇总 = 每个在样区段内**相邻两次有效回答**的配对，可跨过仍在样但没有有效
+答案的轮次。键为（起轮、止轮、起点记录的层、前答案、后答案），值为配对数；
+没有配对的键不保留。汇总表 `answer_transfer_summary` 由分析员直接读取。
+
+### 增量维护（只处理受影响区段）
+
+- 每批录入只对“该批使有效答案实际变化”的成员重推其区段配对；其他成员的
+  修订、区段、配对明细不读、不改。汇总按汇总键做旧值/新值差量更新，不重建整表。
+- 审计行 `answer_revision_batch` / `..._item` 记录本批实际落库的键、受影响成员
+  与区段数，可据此核对更正范围。
+
+```python
+# 绑定、录入、读取
+plan_id = asm.list_panel_plans()[-1]["plan_id"]
+asm.init_answer_transfer(plan_id)
+asm.submit_answer_revisions([
+    {"plan_id": plan_id, "panel_member_id": "PM_...", "revision": 1, "answer": 0},
+    {"plan_id": plan_id, "panel_member_id": "PM_...", "revision": 2, "answer": None},
+])
+asm.answer_transfer_summary()
+# [{'start_wave': 1, 'end_wave': 4, 'stratum_code': 'S',
+#   'from_answer': 0, 'to_answer': 1, 'pair_count': 2}, ...]
+```
+
+### 测试与验证（tests/test_answer_transfer.py，70 项）
+
+- 同一在样区段先只有首尾有效答案（1 条长配对），补入中间答案后变为 2 条短配对；
+  作废中间答案后接回 1 条长配对。另一位成员贡献同一汇总键时，更正只减掉本人
+  计数，验证不会误删别人的计数。
+- 离样后回归的成员（BU-05，且回归后换层）证明不跨区段配对，层取自计划账本。
+- 乱序修订、晚到旧修订、同批多处更改、批内/已存同号冲突、坏输入、非链上键
+  均覆盖；每个汇总键由“计划链账本 + 输入修订”独立推导后与库内结果对照，
+  进程重开后再次对照。
+- 更正范围验证：用 `sqlite3` 的 `set_trace_callback` 捕获 SQL，断言涉及
+  修订/区段/配对/有效答案表的语句只出现受影响成员；读取汇总不触碰这些表。
+  另对无关成员的配对明细与有效答案做逐行快照对照。
 
 ## 接口一览
 

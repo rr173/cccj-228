@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 
 from . import eligibility as elig
 from . import panel as _panel
+from . import answers as _answers
 from .errors import (
     AssembleError,
     EventRejectedError,
@@ -1102,6 +1103,39 @@ class SampleAssembler:
     def current_panel(self, rotation_rule=None):
         """当前已发布的最新一轮 panel 成员清单。"""
         return _panel.current_panel(self.conn, rotation_rule)
+
+    # ================================================================ 回答转移
+    # 只读既有 panel 计划/账本与调查原始数据；不重新计算样本或轮换计划。
+    def init_answer_transfer(self, plan_id):
+        """绑定已发布端点计划，沿 base_plan_id 构建已发布链与在样区段。
+
+        同一端点重复初始化不清空已有修订/配对/汇总；已绑定其他端点时拒绝。
+        """
+        return _answers.initialize(self.conn, plan_id)
+
+    def submit_answer_revisions(self, revisions):
+        """录入一批访谈修订（plan_id/panel_member_id/revision/answer），
+        原子地增量维护受影响成员的配对于持久化汇总。"""
+        return _answers.submit_revisions(self.conn, revisions)
+
+    def answer_transfer_summary(self):
+        """读取已持久化的转移汇总（不重跑访谈配对）。"""
+        return _answers.read_summary(self.conn)
+
+    def answer_transfer_binding(self):
+        return _answers.get_binding(self.conn)
+
+    def list_answer_pairs(self, panel_member_id=None):
+        """查看内部配对明细（按成员/区段），用于核对增量更正范围。"""
+        return _answers.list_pairs(self.conn, panel_member_id)
+
+    def list_answer_segments(self, panel_member_id=None):
+        """查看链上在样区段及每轮当前有效答案。"""
+        return _answers.list_segments(self.conn, panel_member_id)
+
+    def list_answer_batches(self):
+        """查看每批录入的审计行（受影响成员/区段/配对数量）。"""
+        return _answers.list_batches(self.conn)
 
 
 class _RetryAssemble(Exception):

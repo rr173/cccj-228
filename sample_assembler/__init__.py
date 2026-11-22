@@ -3,6 +3,7 @@
 
 from .assembler import SampleAssembler
 from .errors import (
+    AnswerTransferError,
     AssembleError,
     AssemblerError,
     EventRejectedError,
@@ -16,6 +17,7 @@ from .rules import compile_rules
 
 __all__ = [
     "SampleAssembler",
+    "AnswerTransferError",
     "AssemblerError",
     "AssembleError",
     "EventRejectedError",
