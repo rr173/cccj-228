@@ -33,3 +33,7 @@ class AssembleError(AssemblerError):
 
 class PublishError(AssemblerError):
     """批次不满足发布条件。"""
+
+
+class PanelError(AssemblerError):
+    """panel 轮换计划无法生成或校验失败（规则、基数、归类等）。"""

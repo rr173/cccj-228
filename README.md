@@ -2,30 +2,37 @@
 
 从多个名单快照装配分层样本，处理资格核验后的失访/拒绝/撤回，按声明顺序补替补，
 保留原抽样概率与每一步证据，并支持进程重启与多进程并发下的不重复占用。
+在单轮装配之上，支持跨轮次 panel 轮换：由已发布样本/计划与历史账本确定性地
+生成下一轮成员清单与逐成员变更账本。
 
 ## 目录
 
 ```
 sample_assembler/          装配器实现（无第三方依赖，仅标准库）
-  schema.py                SQLite schema 与关键唯一索引
+  schema.py                SQLite schema 与关键唯一索引（v2：含 panel 表）
   rules.py                 层规则编译、边界语义、冲突检测
   eligibility.py           资格事件状态机
-  assembler.py             导入/装配/预览/发布/追溯/分页接口
+  assembler.py             单轮导入/装配/预览/发布/追溯 + panel 接口委托
+  panel.py                 跨轮次轮换：规则导入/计划生成/预览/发布/追溯
   errors.py                领域错误
 reference/
-  reference_sim.py         独立参考模拟程序（不 import 装配器代码）
+  reference_sim.py         单轮装配独立参考模拟程序
+  panel_reference_sim.py   panel 轮换独立参考模拟程序（不 import 装配器代码）
 tests/
-  fixtures.py              手工场景：两层名单、重复 BU、缺失层、拒绝、
-                           逆序事件、跨版本映射、无法补齐层、规则冲突
-  test_assembler.py        端到端断言 + 与参考程序逐项核对（65 项）
+  fixtures.py              单轮手工场景
+  panel_fixtures.py        三轮两层 panel 手工场景
+  test_assembler.py        单轮端到端断言 + 参考核对（65 项）
+  test_panel.py            panel 端到端断言 + 逐轮参考核对（81 项）
   test_concurrency.py      双进程交错装配测试
-  _concurrent_worker.py    并发测试的子进程 worker
+  _concurrent_worker.py    并发装配 worker
+  _panel_worker.py         并发 panel 计划 worker
 ```
 
 ## 运行测试
 
 ```bash
-python3 -I tests/test_assembler.py      # 65 项功能/证据/参考核对
+python3 -I tests/test_assembler.py      # 65 项单轮功能/证据/参考核对
+python3 -I tests/test_panel.py          # 81 项 panel 轮换/账本/参考核对
 python3 -I tests/test_concurrency.py    # 两个装配进程交错，验证无双重分配
 ```
 
@@ -93,6 +100,70 @@ refused/lost）；`refused/lost/withdrew` 为终态。
 原始抽中记录（`kind='original'`）不受该唯一索引限制，允许失败批次
 回滚后重建；批次内另有 `UNIQUE(batch_id, frame_id)` 防同批重复。
 
+## panel 轮换（跨轮次）
+
+在单轮装配之上提供“下一轮 panel 计划”：交付一份可发布的下一轮成员清单
+和逐成员变更账本。只负责跨轮次轮换，不重实现单轮替补链。
+
+### 轮换规则（声明式）
+
+```python
+{
+  "name": "rot1",
+  "frame_rule_set": "rules_v1",      # 新名单归类沿用的层规则集（name 或 id）
+  "max_consecutive_waves": 2,        # 最大连续访问轮数（>=1）
+  "cooldown_waves": 1,               # 退出后的冷却轮数（>=0）
+  "min_retention_ratio": 0.5,        # 本轮可留存的最低比例 [0,1]
+  "strata": [{"code": "S1", "target_n": 2}, ...]   # 目标层与每层目标数
+}
+```
+
+### 轮换语义
+
+- **基数**：首轮从当前已发布样本批次（`published_version`）出发；后续轮
+  只从上一个**已发布**计划与历史账本（`panel_change`）继续，绝不只读
+  当前样本表。上一轮 assignment 不是下一轮的自动入选。
+- **留存候选**：上一轮仍合格（非 refused/lost/withdrew）、未处于冷却、
+  连续轮数未达上限的成员，按稳定排序 `(random_rank, frame_id)` 产生；
+  已拒绝/失访/撤回的成员带原因退出（`exited_refused` 等），连续达上限
+  退出记 `max_consecutive_reached`。
+- **冷却**：退出成员的业务身份在 `cooldown_waves` 轮内不得作为新候选
+  回归（排除原因 `cooldown_active`）；冷却到期后可回归，且沿用同一
+  `panel_member` 身份（成员锚定 business_unit_id，缺省 `frame:<id>`）。
+- **新候选**：只填同层缺口；排除不可联系、终态、历史已占用
+  （`occupied_prior_plan`）、本计划已占用、业务身份冲突
+  （`business_unit_conflict`）、冷却中候选；每个候选的判定留证。
+- **账本**：每个成员每轮一条 `panel_change`（wave、来源 assignment、
+  连续轮数、冷却计数、决定原因），只 INSERT 不覆盖历史轮次；
+  每层一条 `panel_stratum_gap`（目标/留存/新加入/缺口/最低留存要求/
+  不可补齐原因/候选证据）。
+- **留存比例**：每层留存数低于 `ceil(min_retention_ratio * 上轮在样数)`
+  时明确记录 `retention_below_minimum`。
+
+### 计划生命周期与幂等
+
+- 计算结果先落 `draft`（可重试）；`request_key` 唯一，相同请求键重复
+  计算直接返回已有计划——不产生第二个计划、不重复占用候选，进程重开
+  后同样成立。
+- 发布门：所有层达到目标或明确记录不可补齐，且 wave 未过期（过期
+  draft 发布被拒绝）；发布是单语句状态推进，失败/中断不改变上一份
+  已发布计划。
+- 占用兜底：`ux_panel_change_plan_frame`（计划内一候选只属一个成员）
+  与 `ux_panel_change_joined_frame`（全局一候选至多被新加入占用一次）
+  两个部分唯一索引 + `BEGIN IMMEDIATE` 整批重试，跨进程不双重分配。
+
+### 接口
+
+```python
+asm.import_rotation_rules(spec)                 # 导入轮换规则
+asm.generate_next_plan(request_key, frame_version,
+                       rotation_rule=None, note=None)  # 生成下一轮计划（draft）
+asm.preview_plan_changes(plan_id)               # 只读预览逐成员变更
+asm.publish_plan(plan_id)                       # 发布（失败不影响已发布）
+asm.trace_panel_member(identifier)              # panel_member / BU / frame 追溯
+asm.list_panel_plans(); asm.current_panel()     # 计划列表 / 当前在样 panel
+```
+
 ## 接口一览
 
 ```python
@@ -136,3 +207,15 @@ asm.list_batches()
   候选排除原因、被拒事件原因；
 - 双进程（及 4 进程压力）交错装配：替补集合互不相交，
   数据库唯一索引零重复，候选耗尽后新批次全部 unfillable。
+
+### panel 轮换（tests/test_panel.py，81 项）
+
+- 三轮两层手工场景：连续达上限退出、退出后冷却与到期回归（同一
+  panel_member 身份）、资格状态变化退出、留存比例不足记录、
+  候选与历史业务单位冲突、层无法补齐并明确记录原因；
+- 独立参考模拟器逐轮核对：panel_member、留存/退出/新加入决定、
+  连续轮数、冷却计数、缺口原因、候选判定证据、变更账本；
+- 相同请求键重试（含进程重开后）幂等，不产生第二个计划、不重复占用；
+  备选 draft 不重复占用主计划候选；stale/篡改计划发布被拒绝且上一份
+  已发布计划不变；账本跨轮次只增不改；
+- 双进程相同请求键并发：只产生一个计划，候选零重复占用。

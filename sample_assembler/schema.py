@@ -9,7 +9,7 @@
 - 资格事件以 (frame_id, event_type, event_time, source_seq) 去重，实现幂等。
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_STATEMENTS = [
     """
@@ -193,11 +193,115 @@ SCHEMA_STATEMENTS = [
         published_at TEXT NOT NULL
     )
     """,
+    # ---- panel 轮换：声明式轮换规则 ----------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS rotation_rule_set (
+        rotation_rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name             TEXT NOT NULL UNIQUE,
+        frame_rule_set_id INTEGER NOT NULL REFERENCES rule_set(rule_set_id),
+        max_consecutive_waves INTEGER NOT NULL,
+        cooldown_waves   INTEGER NOT NULL,
+        min_retention_ratio REAL NOT NULL,
+        created_at       TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS rotation_stratum_target (
+        rotation_rule_id INTEGER NOT NULL
+            REFERENCES rotation_rule_set(rotation_rule_id),
+        stratum_code TEXT NOT NULL,
+        target_n     INTEGER NOT NULL,
+        ordinal      INTEGER NOT NULL,
+        PRIMARY KEY (rotation_rule_id, stratum_code)
+    )
+    """,
+    # ---- panel 成员稳定身份（锚定业务身份，跨轮次不覆盖） -------------
+    """
+    CREATE TABLE IF NOT EXISTS panel_member (
+        panel_member_id TEXT PRIMARY KEY,     -- PM_<member_key 哈希>
+        member_key      TEXT NOT NULL UNIQUE, -- business_unit_id 或 frame:<frame_id>
+        anchor_business_unit_id TEXT,
+        anchor_frame_id TEXT NOT NULL,        -- 首次进入 panel 时的名单行
+        first_wave      INTEGER NOT NULL,     -- 首次进入的 wave（样本轮=0）
+        created_at      TEXT NOT NULL
+    )
+    """,
+    # ---- panel 计划（可重试版本；request_key 幂等） -------------------
+    """
+    CREATE TABLE IF NOT EXISTS panel_plan (
+        plan_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_key     TEXT NOT NULL UNIQUE,  -- 相同请求键重复计算返回同一计划
+        rotation_rule_id INTEGER NOT NULL
+            REFERENCES rotation_rule_set(rotation_rule_id),
+        wave            INTEGER NOT NULL,
+        frame_version   TEXT NOT NULL,         -- 本轮新候选名单快照
+        base_plan_id    INTEGER,               -- 上一已发布计划（首轮为空）
+        base_batch_id   INTEGER,               -- 首轮基于的已发布样本批次
+        status          TEXT NOT NULL,         -- draft / published
+        created_at      TEXT NOT NULL,
+        published_at    TEXT,
+        note            TEXT
+    )
+    """,
+    # ---- 逐成员变更账本（只 INSERT，不覆盖历史轮次） ------------------
+    """
+    CREATE TABLE IF NOT EXISTS panel_change (
+        change_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        plan_id         INTEGER NOT NULL REFERENCES panel_plan(plan_id),
+        wave            INTEGER NOT NULL,
+        panel_member_id TEXT NOT NULL REFERENCES panel_member(panel_member_id),
+        stratum_code    TEXT NOT NULL,
+        decision        TEXT NOT NULL,         -- retained / exited / joined
+        reason          TEXT NOT NULL,         -- 决定原因
+        frame_id        TEXT,                  -- 本轮占用（退出时为来源）名单行
+        business_unit_id TEXT,
+        source_assignment_id TEXT,             -- 上一轮来源 assignment 身份
+        assignment_id   TEXT,                  -- 本轮 assignment 身份（exited 为空）
+        consecutive_waves INTEGER NOT NULL,    -- 决定后的连续在样轮数
+        cooldown_remaining INTEGER NOT NULL,   -- 决定后的冷却计数
+        created_at      TEXT NOT NULL,
+        UNIQUE (plan_id, panel_member_id)
+    )
+    """,
+    # 计划内：同一名单行至多被一个成员占用（留存或新加入）。
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_panel_change_plan_frame
+        ON panel_change(plan_id, frame_id)
+        WHERE decision IN ('retained', 'joined')
+    """,
+    # 全局兜底：同一名单行至多被“新加入”占用一次（跨计划/跨进程生效，
+    # 与 ux_assignment_substitute_frame 同款语义；draft 计划也构成占用）。
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_panel_change_joined_frame
+        ON panel_change(frame_id) WHERE decision = 'joined'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_panel_change_member
+        ON panel_change(panel_member_id)
+    """,
+    # ---- 每层缺口与候选证据 -------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS panel_stratum_gap (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        plan_id      INTEGER NOT NULL REFERENCES panel_plan(plan_id),
+        stratum_code TEXT NOT NULL,
+        target_n     INTEGER NOT NULL,
+        prev_n       INTEGER NOT NULL,         -- 上一轮该层在样数
+        retained_n   INTEGER NOT NULL,
+        joined_n     INTEGER NOT NULL,
+        open_slots   INTEGER NOT NULL,         -- 未能补齐的名额
+        retention_required INTEGER NOT NULL,   -- 最低留存要求
+        retention_ok INTEGER NOT NULL,
+        reason       TEXT,                     -- 不可补齐 / 留存不足说明
+        considered_json TEXT NOT NULL DEFAULT '[]',
+        UNIQUE (plan_id, stratum_code)
+    )
+    """,
 ]
 
 
 def initialize_db(conn):
-    """建表并写入 schema 版本（幂等）。"""
+    """建表并写入 schema 版本（幂等；旧库按 IF NOT EXISTS 语句平滑升级）。"""
     for stmt in SCHEMA_STATEMENTS:
         conn.execute(stmt)
     cur = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'")
@@ -208,7 +312,14 @@ def initialize_db(conn):
             (str(SCHEMA_VERSION),),
         )
         conn.commit()
-    elif int(row[0]) != SCHEMA_VERSION:
+    elif int(row[0]) < SCHEMA_VERSION:
+        # 所有建表语句均幂等，旧库直接补齐新表后提升版本号
+        conn.execute(
+            "UPDATE schema_meta SET value=? WHERE key='schema_version'",
+            (str(SCHEMA_VERSION),),
+        )
+        conn.commit()
+    elif int(row[0]) > SCHEMA_VERSION:
         raise RuntimeError(
             "schema 版本不匹配：库=%s 代码=%s" % (row[0], SCHEMA_VERSION)
         )

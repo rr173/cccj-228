@@ -21,6 +21,7 @@ import uuid
 from datetime import datetime, timezone
 
 from . import eligibility as elig
+from . import panel as _panel
 from .errors import (
     AssembleError,
     EventRejectedError,
@@ -1065,6 +1066,42 @@ class SampleAssembler:
             })
         return {"identifier": identifier, "found": True,
                 "frames": frames, "chains": chains}
+
+    # ================================================================ panel 轮换
+    # 跨轮次轮换能力（实现在 panel.py）；不改变既有单轮装配语义。
+    def import_rotation_rules(self, spec):
+        """导入声明式轮换规则（目标层/每层目标数/最大连续轮数/冷却轮数/
+        本轮最低留存比例），返回 rotation_rule_id。"""
+        return _panel.import_rotation_rules(self, spec)
+
+    def generate_next_plan(self, request_key, frame_version,
+                           rotation_rule=None, note=None):
+        """生成下一轮 panel 计划（draft，可重试）。
+
+        相同 request_key 重复调用返回同一计划，不产生第二个计划、不重复
+        占用候选；后续轮从已发布计划与历史账本继续计算。
+        """
+        return _panel.generate_next_plan(
+            self, request_key, frame_version, rotation_rule, note)
+
+    def preview_plan_changes(self, plan_id):
+        """只读预览计划的逐成员变更账本与层级缺口（不产生写入）。"""
+        return _panel.preview_plan_changes(self.conn, plan_id)
+
+    def publish_plan(self, plan_id):
+        """发布计划：所有层达标或明确记录不可补齐；失败不改变上一已发布计划。"""
+        return _panel.publish_plan(self.conn, plan_id)
+
+    def trace_panel_member(self, identifier):
+        """按 panel_member_id / business_unit_id / frame_id 追溯跨轮次历史。"""
+        return _panel.trace_panel_member(self.conn, identifier)
+
+    def list_panel_plans(self):
+        return _panel.list_panel_plans(self.conn)
+
+    def current_panel(self, rotation_rule=None):
+        """当前已发布的最新一轮 panel 成员清单。"""
+        return _panel.current_panel(self.conn, rotation_rule)
 
 
 class _RetryAssemble(Exception):
